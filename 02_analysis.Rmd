@@ -1,0 +1,334 @@
+---
+title: "Evolution of influenza A (H3N2) haemagglutinin and antigenic drift"
+author: "Student registration number"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7, fig.height = 5, dpi = 150)
+set.seed(2026)  # reproducibility
+dir.create("../figures", showWarnings = FALSE)
+dir.create("../results", showWarnings = FALSE)
+```
+
+# 1. Setup
+
+```{r packages}
+# Install once:
+# if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install(c("Biostrings", "msa"))
+# install.packages(c("tidyverse", "ape", "phangorn", "randomForest", "rentrez"))
+
+library(Biostrings)    # sequence handling
+library(msa)           # multiple sequence alignment
+library(ape)           # phylogenetics
+library(phangorn)      # distances, bootstrap
+library(tidyverse)     # data wrangling + ggplot2
+library(randomForest)  # predictive model
+```
+
+# 2. Data import
+
+Sequences were downloaded with `01_download_data.R` (NCBI GenBank, HA gene,
+H3N2, 2014-2024).
+
+```{r import}
+fa <- readDNAStringSet("../data/h3n2_ha.fasta")
+length(fa)
+
+# Parse metadata from the FASTA headers, e.g.
+# ">CY121680.1 Influenza A virus (A/Boston/DOA2107/2012(H3N2)) hemagglutinin (HA) gene, complete cds"
+meta <- tibble(
+  header    = names(fa),
+  accession = str_extract(header, "^\\S+"),
+  strain    = str_match(header, "\\((A/[^()]*)\\(H3N2\\)\\)")[, 2],
+  year      = as.integer(str_match(header, "/(\\d{4})\\(H3N2\\)")[, 2]),
+  length    = width(fa),
+  gc        = as.numeric(letterFrequency(fa, "GC", as.prob = TRUE)),
+  n_frac    = as.numeric(letterFrequency(fa, "N",  as.prob = TRUE))
+)
+glimpse(meta)
+```
+
+# 3. Quality control and cleaning
+
+```{r qc}
+cat("Raw sequences:", nrow(meta), "\n")
+cat("Missing year:", sum(is.na(meta$year)), "\n")
+cat("Duplicate accessions:", sum(duplicated(meta$accession)), "\n")
+
+# Keep complete-length sequences with few ambiguous bases and a known year
+keep <- !is.na(meta$year) & !duplicated(meta$accession) &
+        meta$n_frac < 0.01 & meta$length >= 1650 & meta$length <= 2000
+cat("Passing QC:", sum(keep), "\n")
+
+fa   <- fa[keep]
+meta <- meta[keep, ]
+names(fa) <- meta$accession
+```
+
+```{r fig-counts}
+p_counts <- ggplot(meta, aes(factor(year))) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Sequences per year after QC", x = "Year", y = "Number of sequences")
+p_counts
+ggsave("../figures/fig1_counts_per_year.png", p_counts, width = 7, height = 4)
+```
+
+```{r fig-qc}
+p_len <- ggplot(meta, aes(length)) +
+  geom_histogram(bins = 30, fill = "grey40") +
+  theme_minimal() + labs(title = "Sequence length", x = "Nucleotides", y = "Count")
+
+p_gc <- ggplot(meta, aes(factor(year), gc * 100)) +
+  geom_boxplot(fill = "orange", alpha = 0.7) +
+  theme_minimal() + labs(title = "GC content by year", x = "Year", y = "GC (%)")
+
+p_len
+p_gc
+ggsave("../figures/fig2a_length.png", p_len, width = 6, height = 4)
+ggsave("../figures/fig2b_gc.png", p_gc, width = 7, height = 4)
+```
+
+# 4. Extract coding sequence and translate
+
+HA starts at the first ATGAAG (Met-Lys). We translate from there and stop at
+the first stop codon.
+
+```{r translate}
+txt   <- as.character(fa)
+start <- as.integer(regexpr("ATGAAG", txt, fixed = TRUE))
+ok    <- start > 0
+
+cds  <- subseq(fa[ok], start = start[ok])
+prot <- suppressWarnings(translate(cds, if.fuzzy.codons = "X"))
+prot_chr <- sub("\\*.*$", "", as.character(prot))   # cut at first stop
+
+# Keep proteins that start with M and have a plausible HA length (~566 aa)
+good <- startsWith(prot_chr, "M") & nchar(prot_chr) >= 550 & nchar(prot_chr) <= 575
+cat("Proteins retained:", sum(good), "\n")
+
+meta <- meta[ok, ][good, ]
+prot_set <- AAStringSet(prot_chr[good])
+names(prot_set) <- meta$accession
+```
+
+# 5. Multiple sequence alignment
+
+```{r align}
+aln    <- msa(prot_set, method = "Muscle", type = "protein")
+aa_aln <- as(aln, "AAStringSet")
+mat    <- as.matrix(aa_aln)       # sequences x sites (character matrix)
+
+# Make sure metadata and alignment rows are in the same order
+meta <- meta[match(rownames(mat), meta$accession), ]
+stopifnot(all(meta$accession == rownames(mat)))
+
+dim(mat)
+```
+
+# 6. Divergence from a reference over time
+
+The reference is the per-site consensus of the **earliest year** in the data.
+To compare against an actual WHO vaccine strain instead, add that sequence to
+the download and use it as the reference.
+
+```{r divergence}
+gap_or_x <- c("-", "X")
+
+consensus_of <- function(x) {
+  x <- x[!x %in% gap_or_x]
+  if (length(x) == 0) return(NA_character_)
+  names(which.max(table(x)))
+}
+
+ref_year  <- min(meta$year)
+reference <- apply(mat[meta$year == ref_year, , drop = FALSE], 2, consensus_of)
+
+# Number of amino acid substitutions of each sequence relative to the reference
+meta$n_subs <- vapply(seq_len(nrow(mat)), function(i) {
+  s  <- mat[i, ]
+  ok <- !is.na(reference) & !s %in% gap_or_x
+  sum(s[ok] != reference[ok])
+}, numeric(1))
+
+# Statistical tests: does divergence increase with time?
+cor_res <- cor.test(meta$year, meta$n_subs, method = "spearman", exact = FALSE)
+fit     <- lm(n_subs ~ year, data = meta)
+cor_res
+summary(fit)
+confint(fit)["year", ]   # estimated substitutions gained per year
+```
+
+```{r fig-divergence}
+p_div <- ggplot(meta, aes(year, n_subs)) +
+  geom_jitter(width = 0.15, alpha = 0.5, colour = "firebrick") +
+  geom_smooth(method = "lm", colour = "black") +
+  scale_x_continuous(breaks = sort(unique(meta$year))) +
+  theme_minimal() +
+  labs(title = paste0("HA divergence from the ", ref_year, " consensus"),
+       subtitle = paste0("Spearman rho = ", round(cor_res$estimate, 2),
+                         ", p = ", signif(cor_res$p.value, 2)),
+       x = "Year", y = "Amino acid substitutions")
+p_div
+ggsave("../figures/fig3_divergence.png", p_div, width = 7, height = 5)
+```
+
+# 7. Site-wise variability and antigenic sites
+
+```{r entropy}
+site_stats <- tibble(
+  aln_pos = seq_len(ncol(mat)),
+  entropy = apply(mat, 2, function(x) {
+    x <- x[!x %in% gap_or_x]
+    if (length(x) == 0) return(NA_real_)
+    p <- table(x) / length(x)
+    -sum(p * log2(p))
+  }),
+  maf = apply(mat, 2, function(x) {       # minor allele frequency
+    x <- x[!x %in% gap_or_x]
+    if (length(x) == 0) return(NA_real_)
+    1 - max(table(x)) / length(x)
+  })
+)
+
+# H3 numbering excludes the 16-residue signal peptide
+site_stats$h3_pos <- site_stats$aln_pos - 16
+
+# Classical H3 antigenic sites A-E (Wiley et al. 1981; Wilson & Cox 1990).
+# IMPORTANT: verify these position lists against the primary literature
+# before submitting, and cite your source in the report.
+antigenic <- list(
+  A = c(122, 124, 126, 130:133, 135, 137, 138, 140, 142:146, 150, 152, 168),
+  B = c(128, 129, 155:160, 163:165, 186:190, 192:194),
+  C = c(44:48, 50, 51, 53, 54, 273, 275, 276, 278:280, 294, 297, 299, 300,
+        304, 305, 307:312),
+  D = c(96, 102, 103, 117, 121, 167, 170:177, 179, 182, 201, 203, 207:209,
+        212:219, 226:230, 238, 240, 242, 244, 246:248),
+  E = c(57, 59, 62, 63, 67, 75, 78, 80:83, 86:88, 91, 92, 94, 109,
+        260:262, 265)
+)
+antigenic_all <- sort(unique(unlist(antigenic)))
+site_stats$antigenic <- site_stats$h3_pos %in% antigenic_all
+
+# Define "variable" sites as those with a minor allele frequency of >= 2%
+site_stats$variable <- !is.na(site_stats$maf) & site_stats$maf >= 0.02
+table(variable = site_stats$variable, antigenic = site_stats$antigenic)
+```
+
+```{r fig-entropy}
+p_ent <- ggplot(site_stats, aes(h3_pos, entropy)) +
+  geom_segment(aes(xend = h3_pos, yend = 0, colour = antigenic), linewidth = 0.4) +
+  scale_colour_manual(values = c("grey70", "firebrick"),
+                      labels = c("Other", "Antigenic site")) +
+  theme_minimal() +
+  labs(title = "Per-site variability along HA",
+       x = "Position (H3 numbering)", y = "Shannon entropy (bits)", colour = "")
+p_ent
+ggsave("../figures/fig4_entropy.png", p_ent, width = 8, height = 4)
+```
+
+```{r fisher}
+# Are variable sites enriched in the antigenic sites?
+# Caveat: sequences share ancestry, so p-values should be read cautiously.
+tab <- table(variable = site_stats$variable, antigenic = site_stats$antigenic)
+tab
+fisher.test(tab)
+```
+
+# 8. Phylogeny
+
+```{r tree}
+phy  <- phyDat(mat, type = "AA")
+tree <- NJ(dist.hamming(phy))
+tree$edge.length <- pmax(tree$edge.length, 0)   # NJ can give tiny negatives
+
+# Bootstrap support (100 replicates; increase for the final report)
+bs <- bootstrap.phyDat(phy, FUN = function(x) NJ(dist.hamming(x)), bs = 100)
+support <- prop.clades(tree, bs) / length(bs) * 100
+summary(support)
+```
+
+```{r fig-tree, fig.width=8, fig.height=8}
+yrs  <- meta$year[match(tree$tip.label, meta$accession)]
+pal  <- hcl.colors(length(unique(yrs)), "viridis")
+cols <- pal[as.integer(factor(yrs))]
+
+draw_tree <- function() {
+  plot(tree, type = "unrooted", show.tip.label = FALSE, edge.width = 0.6,
+       no.margin = TRUE)
+  tiplabels(pch = 16, col = cols, cex = 0.6)
+  legend("bottomleft", legend = levels(factor(yrs)), pt.bg = pal, pch = 21,
+         title = "Year", cex = 0.7, bty = "n")
+}
+draw_tree()
+png("../figures/fig5_tree.png", width = 1600, height = 1600, res = 200)
+draw_tree()
+dev.off()
+```
+
+# 9. Predictive model: can sequence predict the year?
+
+A random forest regresses the sampling year on residues at variable sites.
+Out-of-bag (OOB) error gives an honest internal estimate, and variable
+importance highlights the sites that track time most strongly.
+
+```{r rf}
+var_pos <- site_stats$aln_pos[site_stats$variable]
+X <- as.data.frame(mat[, var_pos, drop = FALSE], stringsAsFactors = TRUE)
+colnames(X) <- paste0("P", var_pos)   # P<alignment position>
+
+rf <- randomForest(x = X, y = meta$year, ntree = 500, importance = TRUE)
+rf   # % variance explained is the OOB estimate
+
+oob_df <- tibble(actual = meta$year, predicted = rf$predicted)
+p_rf <- ggplot(oob_df, aes(actual, predicted)) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  geom_abline(linetype = 2) +
+  theme_minimal() +
+  labs(title = "Random forest: out-of-bag predicted vs actual year",
+       subtitle = paste0("% variance explained: ", round(tail(rf$rsq, 1) * 100, 1)),
+       x = "Actual year", y = "Predicted year")
+p_rf
+ggsave("../figures/fig6_rf_oob.png", p_rf, width = 6, height = 5)
+```
+
+```{r rf-importance}
+imp <- importance(rf, type = 1) |>
+  as.data.frame() |>
+  rownames_to_column("site") |>
+  rename(inc_mse = `%IncMSE`) |>
+  mutate(aln_pos = as.integer(sub("P", "", site)),
+         h3_pos  = aln_pos - 16,
+         antigenic = h3_pos %in% antigenic_all) |>
+  arrange(desc(inc_mse))
+
+top_sites <- head(imp, 15)
+top_sites
+write.csv(top_sites, "../results/top_rf_sites.csv", row.names = FALSE)
+
+p_imp <- ggplot(top_sites, aes(reorder(factor(h3_pos), inc_mse), inc_mse, fill = antigenic)) +
+  geom_col() + coord_flip() +
+  scale_fill_manual(values = c("grey60", "firebrick")) +
+  theme_minimal() +
+  labs(title = "Top 15 sites predicting year", x = "HA position (H3 numbering)",
+       y = "% increase in MSE when permuted", fill = "Antigenic site")
+p_imp
+ggsave("../figures/fig7_rf_importance.png", p_imp, width = 6, height = 5)
+```
+
+# 10. Reproducibility
+
+```{r session}
+sessionInfo()
+citation("Biostrings")
+citation("msa")
+citation("phangorn")
+citation("randomForest")
+```

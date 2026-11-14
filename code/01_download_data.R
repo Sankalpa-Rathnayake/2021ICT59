@@ -1,14 +1,13 @@
 # =============================================================================
-# 01_download_data.R
+# 01_download_data.R  (v3)
 # Download influenza A (H3N2) haemagglutinin (HA) sequences from NCBI GenBank.
 #
-# Run this script with the working directory set to the code/ folder.
+# Run with the working directory set to the code/ folder.
 # Output: ../data/h3n2_ha.fasta
 #
-# A fixed random seed and a fixed number of sequences per year keep the
-# download reproducible. Note that NCBI adds new sequences over time, so the
-# exact sampled set can change if you re-run this later; the committed FASTA
-# file in data/ is the version used for the report.
+# v3: tries several query styles per year and uses the first one that returns
+# records. It also prints how NCBI interpreted the query, which makes any
+# remaining problem easy to diagnose.
 # =============================================================================
 
 # install.packages("rentrez")
@@ -17,23 +16,47 @@ library(rentrez)
 set.seed(2026)
 
 years    <- 2014:2024   # seasons to sample
-per_year <- 25          # max sequences sampled per year (keeps runtime low)
+per_year <- 25          # max sequences sampled per year
 out_dir  <- "../data"
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 # Optional: an NCBI API key allows more requests per second
 # set_entrez_key("YOUR_KEY_HERE")
 
-fetch_year <- function(yr) {
-  # Strain names look like A/Texas/50/2012(H3N2), so the year is a title token
-  term <- paste0('"Influenza A virus"[Organism] AND H3N2[Title] AND ',
-                 'hemagglutinin[Title] AND "complete cds"[Title] AND ',
-                 yr, '[Title]')
+safe_search <- function(term) {
+  tryCatch(entrez_search(db = "nuccore", term = term, retmax = 300),
+           error = function(e) {
+             message("  Search error: ", conditionMessage(e))
+             NULL
+           })
+}
 
-  res <- tryCatch(entrez_search(db = "nuccore", term = term, retmax = 300),
-                  error = function(e) NULL)
-  if (is.null(res) || length(res$ids) == 0) {
-    message("Year ", yr, ": no sequences found")
+# Candidate queries, from strictest to most forgiving.
+# Note: no quoted "complete cds" phrase, which NCBI sometimes fails to match.
+candidate_terms <- function(yr) {
+  c(
+    paste0('"Influenza A virus"[Organism] AND H3N2[Title] AND hemagglutinin[Title] ',
+           'AND complete[Title] AND cds[Title] AND ', yr, '[Title]'),
+    paste0('"Influenza A virus"[Organism] AND H3N2[Title] AND hemagglutinin[Title] ',
+           'AND complete[Title] AND cds[Title] AND ', yr, '[PDAT]'),
+    paste0('Influenza A virus H3N2 hemagglutinin complete cds AND ', yr, '[PDAT]'),
+    paste0('H3N2 hemagglutinin AND ', yr, '[PDAT]')
+  )
+}
+
+fetch_year <- function(yr) {
+  res <- NULL
+  for (term in candidate_terms(yr)) {
+    r <- safe_search(term)
+    if (!is.null(r) && length(r$ids) >= 10) { res <- r; break }
+    if (!is.null(r)) {
+      message("  No hits for: ", term)
+      message("  NCBI read it as: ", r$QueryTranslation)
+    }
+  }
+
+  if (is.null(res)) {
+    message("Year ", yr, ": no sequences found with any query")
     return(character(0))
   }
 
@@ -41,16 +64,23 @@ fetch_year <- function(yr) {
   if (length(ids) > per_year) ids <- sample(ids, per_year)
   message("Year ", yr, ": fetching ", length(ids), " of ", res$count, " records")
 
-  # Fetch in one request per year (<= 25 records)
   Sys.sleep(0.5)  # be polite to NCBI
   fa <- tryCatch(entrez_fetch(db = "nuccore", id = ids,
                               rettype = "fasta", retmode = "text"),
-                 error = function(e) NA_character_)
+                 error = function(e) {
+                   message("  Fetch error: ", conditionMessage(e))
+                   NA_character_
+                 })
   if (is.na(fa)) return(character(0))
   fa
 }
 
 all_fasta <- unlist(lapply(years, fetch_year))
-writeLines(all_fasta, file.path(out_dir, "h3n2_ha.fasta"))
 
-message("Done. Wrote ", file.path(out_dir, "h3n2_ha.fasta"))
+if (length(all_fasta) == 0) {
+  stop("No sequences were downloaded. Check the messages above.")
+}
+
+writeLines(all_fasta, file.path(out_dir, "h3n2_ha.fasta"))
+message("Done. Wrote ", file.path(out_dir, "h3n2_ha.fasta"),
+        " (", length(all_fasta), " year batches)")
